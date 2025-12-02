@@ -42,6 +42,12 @@ class OptimizationConfig:
     bank: float = 0.0  # Money in the bank
     objective: ObjectiveType = ObjectiveType.POINTS
     max_transfers: Optional[int] = None  # Force specific number of transfers (None = auto)
+    available_chips: List[Chip] = None  # Available chips to consider
+
+    def __post_init__(self):
+        """Initialize available_chips to empty list if None."""
+        if self.available_chips is None:
+            self.available_chips = []
 
 
 @dataclass
@@ -277,7 +283,7 @@ class FPLOptimizer:
             transfer_plans=transfer_plans,
             total_expected_points=total_expected,
             horizon_breakdown=horizon_breakdown,
-            chip_recommendations=self._recommend_chips(current_gw, config.horizon_weeks)
+            chip_recommendations=self._recommend_chips(current_gw, config.horizon_weeks, config.available_chips)
         )
 
     def _optimize_single_week(
@@ -311,9 +317,70 @@ class FPLOptimizer:
         # Objective: maximize expected points
         objective_values = self._get_objective_values(config, gameweek)
 
+        # CRITICAL: Smart penalty system for unavailable/doubtful players
+        # Graduated penalties based on injury severity
+        availability_penalty = {}
+        for p in self.players:
+            if not p.is_available:
+                # Check injury severity using status and chance_of_playing
+                status = getattr(p, 'status', 'a')
+                chance = getattr(p, 'chance_of_playing_next_round', None)
+
+                if status == 'u':
+                    # Unavailable (loan, sold) - MUST remove
+                    availability_penalty[p.id] = -20.0
+                elif status == 's':
+                    # Suspended (red card) - MUST remove
+                    availability_penalty[p.id] = -20.0
+                elif status == 'i':
+                    # Injured (unknown return) - Strongly encourage transfer
+                    availability_penalty[p.id] = -15.0
+                elif status == 'd' and chance is not None:
+                    # Doubtful - graduated penalty based on chance
+                    if chance >= 75:
+                        # Minor knock (75%+) - Small penalty, keep on bench is fine
+                        availability_penalty[p.id] = -3.0
+                    elif chance >= 50:
+                        # 50-75% - Moderate penalty
+                        availability_penalty[p.id] = -8.0
+                    elif chance >= 25:
+                        # 25-50% - Significant penalty
+                        availability_penalty[p.id] = -12.0
+                    else:
+                        # 0-25% - Strong penalty
+                        availability_penalty[p.id] = -18.0
+                else:
+                    # Default: unavailable without details
+                    availability_penalty[p.id] = -15.0
+            else:
+                availability_penalty[p.id] = 0.0
+
+        # Calculate bench boost bonus if applicable
+        # If Bench Boost is coming up, weight ALL 15 players (not just starting 11)
+        bench_boost_weight = {}
+        if Chip.BENCH_BOOST in config.available_chips:
+            # Check if we're planning for Bench Boost in this gameweek
+            current_gw = self._get_current_gameweek()
+            bb_gw = 17 if current_gw <= 19 else 36  # Recommended BB gameweek
+
+            # If Bench Boost is within planning horizon, add bench player value
+            if bb_gw >= gameweek and bb_gw < gameweek + config.horizon_weeks:
+                # Weight bench players at 50% for BB preparation
+                # This ensures we build a strong 15-man squad, not just strong starting 11
+                for p in self.players:
+                    bench_boost_weight[p.id] = objective_values[p.id] * 0.5
+            else:
+                for p in self.players:
+                    bench_boost_weight[p.id] = 0.0
+        else:
+            for p in self.players:
+                bench_boost_weight[p.id] = 0.0
+
         model += pulp.lpSum([
-            starting_vars[p.id] * objective_values[p.id] +
-            captain_vars[p.id] * objective_values[p.id]
+            starting_vars[p.id] * objective_values[p.id] +  # Starting 11 full weight
+            captain_vars[p.id] * objective_values[p.id] +  # Captain bonus
+            player_vars[p.id] * availability_penalty[p.id] +  # Penalty for unavailable
+            (player_vars[p.id] - starting_vars[p.id]) * bench_boost_weight[p.id]  # Bench bonus for BB prep
             for p in self.players
         ])
 
@@ -648,8 +715,103 @@ class FPLOptimizer:
         upcoming = [f.event for f in self.fixtures if not f.finished]
         return min(upcoming) if upcoming else max(f.event for f in self.fixtures)
 
-    def _recommend_chips(self, current_gw: int, horizon: int) -> Dict[Chip, int]:
-        """Recommend when to use chips (placeholder for now)."""
-        # This would analyze fixtures for DGW/BGW
-        # For now, return empty recommendations
-        return {}
+    def _recommend_chips(self, current_gw: int, horizon: int, available_chips: List[Chip] = None) -> Dict[Chip, int]:
+        """
+        Recommend when to use chips based on fixture analysis and gameweek context.
+
+        Args:
+            current_gw: Current gameweek number
+            horizon: Number of gameweeks to look ahead
+            available_chips: List of chips the user still has available
+
+        Returns:
+            Dict mapping Chip -> recommended gameweek
+        """
+        if not available_chips:
+            return {}
+
+        recommendations = {}
+
+        # Analyze fixtures for the horizon
+        fixture_density = self._analyze_fixture_density(current_gw, current_gw + horizon)
+        best_fixture_gw = self._find_best_fixture_gameweek(current_gw, current_gw + horizon)
+
+        # Determine which half of season we're in
+        is_first_half = current_gw <= 19
+
+        for chip in available_chips:
+            if chip == Chip.WILDCARD:
+                # Wildcard: Use before fixture swings or during congestion
+                # First half: GW16-18 (winter fixtures)
+                # Second half: GW33-36 (prepare for DGWs)
+                if is_first_half:
+                    if current_gw < 16:
+                        recommendations[chip] = 17
+                else:
+                    if current_gw < 34:
+                        recommendations[chip] = 34
+
+            elif chip == Chip.BENCH_BOOST:
+                # Bench Boost: Use when all 15 players have good fixtures
+                # Look for weeks with many easy fixtures or DGWs
+                if is_first_half:
+                    # In first half, look for good fixture weeks
+                    if best_fixture_gw and best_fixture_gw <= current_gw + horizon:
+                        recommendations[chip] = best_fixture_gw
+                    else:
+                        recommendations[chip] = 17
+                else:
+                    # In second half, target DGWs (typically GW36-37)
+                    recommendations[chip] = 36 if current_gw < 36 else 37
+
+            elif chip == Chip.TRIPLE_CAPTAIN:
+                # Triple Captain: Use when premium players have excellent fixtures
+                # Look for best captain fixture in horizon
+                if best_fixture_gw and best_fixture_gw <= current_gw + horizon:
+                    recommendations[chip] = best_fixture_gw
+                elif is_first_half:
+                    recommendations[chip] = 18
+                else:
+                    # Target DGWs
+                    recommendations[chip] = 36 if current_gw < 36 else 37
+
+            elif chip == Chip.FREE_HIT:
+                # Free Hit: Use on blank gameweeks or difficult fixture weeks
+                # Typically BGW in GW18 or GW25
+                if is_first_half:
+                    recommendations[chip] = 18
+                else:
+                    # GW25 is typically a blank gameweek
+                    recommendations[chip] = 25 if current_gw < 25 else current_gw + 1
+
+        return recommendations
+
+    def _analyze_fixture_density(self, start_gw: int, end_gw: int) -> Dict[int, int]:
+        """
+        Analyze fixture density (number of fixtures) per gameweek.
+        Used to identify double/blank gameweeks.
+        """
+        density = {}
+        for gw in range(start_gw, end_gw + 1):
+            gw_fixtures = [f for f in self.fixtures if f.event == gw]
+            density[gw] = len(gw_fixtures)
+        return density
+
+    def _find_best_fixture_gameweek(self, start_gw: int, end_gw: int) -> Optional[int]:
+        """
+        Find the gameweek with the easiest fixtures (lowest avg difficulty).
+        """
+        gw_difficulty = {}
+
+        for gw in range(start_gw, end_gw + 1):
+            gw_fixtures = [f for f in self.fixtures if f.event == gw]
+            if gw_fixtures:
+                # Average difficulty across all fixtures
+                avg_diff = sum(f.team_h_difficulty + f.team_a_difficulty for f in gw_fixtures) / (2 * len(gw_fixtures))
+                gw_difficulty[gw] = avg_diff
+
+        if not gw_difficulty:
+            return None
+
+        # Return gameweek with lowest average difficulty
+        return min(gw_difficulty.items(), key=lambda x: x[1])[0]

@@ -40,6 +40,20 @@ class FPLClient:
 
     def _load_cookies_from_env(self):
         """Load authentication cookies from environment variables."""
+        # Try OAuth tokens first (new auth system)
+        access_token = os.getenv('FPL_ACCESS_TOKEN')
+        refresh_token = os.getenv('FPL_REFRESH_TOKEN')
+
+        if access_token:
+            # Set OAuth tokens as cookies
+            self.session.cookies.set('access_token', access_token, domain='.premierleague.com')
+            if refresh_token:
+                self.session.cookies.set('refresh_token', refresh_token, domain='.premierleague.com')
+            self.authenticated = True
+            print("✓ Loaded OAuth tokens from .env")
+            return
+
+        # Fall back to old cookie system
         pl_profile = os.getenv('FPL_COOKIE_PL_PROFILE')
         sessionid = os.getenv('FPL_COOKIE_SESSIONID')
 

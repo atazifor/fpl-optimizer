@@ -8,7 +8,7 @@ import os
 
 from .fpl_client import FPLClient
 from .models import Player, Team, Fixture, SquadConstraints
-from .optimizer import FPLOptimizer, OptimizationConfig
+from .optimizer import FPLOptimizer, OptimizationConfig, Chip
 from .predictor import ExpectedPointsPredictor
 
 app = FastAPI(title="FPL Optimizer API")
@@ -92,14 +92,23 @@ class TransferSuggestion(BaseModel):
     player_out_id: int
     player_out_name: str
     player_out_position: str
+    player_out_team: str
     player_out_cost: float
+    player_out_total_points: int
+    player_out_form: float
+    player_out_expected_points: float
     player_out_fixtures: List[str]  # Next 3 fixtures
     player_in_id: int
     player_in_name: str
     player_in_position: str
+    player_in_team: str
     player_in_cost: float
+    player_in_total_points: int
+    player_in_form: float
+    player_in_expected_points: float
     player_in_fixtures: List[str]  # Next 3 fixtures
     cost_change: float
+    points_gain: float
 
 
 class TransferRecommendationResponse(BaseModel):
@@ -112,6 +121,7 @@ class TransferRecommendationResponse(BaseModel):
     transfers: List[TransferSuggestion]
     captain_pick: Optional[CaptainOption] = None
     vice_captain_pick: Optional[CaptainOption] = None
+    bench_order: List[int] = []  # Player IDs in bench order (12th, 13th, 14th, 15th)
 
 
 # Global client (reuse across requests)
@@ -380,6 +390,259 @@ async def get_my_team():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/next-gw-team", response_model=MyTeamResponse)
+async def get_next_gw_team(num_transfers: Optional[int] = None):
+    """Get projected team for NEXT gameweek after applying recommended transfers."""
+    try:
+        fpl_client = get_client()
+
+        # Fetch data
+        my_team = fpl_client.get_my_team()
+        my_info = fpl_client.get_my_info()
+        my_history = fpl_client.get_my_history()
+        bootstrap = fpl_client.get_bootstrap_static()
+
+        # Calculate free transfers
+        current_gws = my_history['current']
+        if len(current_gws) >= 2:
+            last_gw = current_gws[-1]
+            prev_gw = current_gws[-2]
+            prev_transfers = prev_gw.get('event_transfers', 0)
+            ft_available_last_gw = 2 if prev_transfers == 0 else 1
+            last_transfers = last_gw.get('event_transfers', 0)
+            last_cost = last_gw.get('event_transfers_cost', 0)
+
+            if last_transfers == 0:
+                free_transfers = min(2, ft_available_last_gw + 1)
+            elif last_cost == 0:
+                free_transfers = min(2, (ft_available_last_gw - last_transfers) + 1)
+            else:
+                free_transfers = 1
+        else:
+            free_transfers = 1
+
+        # Get current squad
+        current_player_ids = [pick['element'] for pick in my_team['picks']]
+
+        # Get all players
+        all_players = [Player(**p) for p in bootstrap['elements']]
+        current_squad_players = [p for p in all_players if p.id in current_player_ids]
+        available_for_transfer = [p for p in all_players if p.is_available]
+
+        # Combine for optimization
+        all_player_ids = set([p.id for p in current_squad_players] + [p.id for p in available_for_transfer])
+        optimization_players = [p for p in all_players if p.id in all_player_ids]
+
+        # Get fixtures and teams
+        current_gw = fpl_client.get_current_gameweek()
+        fixtures_data = fpl_client.get_fixtures()
+        teams_data = [Team(**t) for t in bootstrap['teams']]
+        teams = {t.id: t for t in teams_data}
+        fixtures = [Fixture(**f) for f in fixtures_data]
+
+        # Get available chips
+        chips_used = my_history.get('chips', [])
+        available_chips = []
+
+        if not any(c['name'] == 'wildcard' for c in chips_used):
+            available_chips.append(Chip.WILDCARD)
+        if not any(c['name'] == 'freehit' for c in chips_used):
+            available_chips.append(Chip.FREE_HIT)
+        if not any(c['name'] == 'bboost' for c in chips_used):
+            available_chips.append(Chip.BENCH_BOOST)
+        if not any(c['name'] == '3xc' for c in chips_used):
+            available_chips.append(Chip.TRIPLE_CAPTAIN)
+
+        # Determine horizon based on chip timing
+        horizon_weeks = 2
+        chip_gws = []
+
+        if Chip.BENCH_BOOST in available_chips:
+            bb_gw = 17 if current_gw <= 19 else 36
+            if bb_gw > current_gw:
+                chip_gws.append(bb_gw)
+
+        if Chip.TRIPLE_CAPTAIN in available_chips:
+            tc_gw = 18 if current_gw <= 19 else 36
+            if tc_gw > current_gw:
+                chip_gws.append(tc_gw)
+
+        if chip_gws:
+            max_chip_gw = max(chip_gws)
+            weeks_until_chip = max_chip_gw - current_gw
+            horizon_weeks = min(weeks_until_chip + 1, 5)
+
+        # Run optimizer to get recommended transfers
+        config = OptimizationConfig(
+            horizon_weeks=horizon_weeks,
+            free_transfers=free_transfers,
+            max_transfers=num_transfers,  # Use provided num_transfers if specified
+            available_chips=available_chips
+        )
+        optimizer = FPLOptimizer(optimization_players, fixtures, teams)
+        result = optimizer.optimize_with_transfers(
+            current_player_ids,
+            config=config
+        )
+
+        # Get the optimized squad after transfers
+        new_squad = result.current_squad
+
+        # Extract transfers
+        first_plan = result.transfer_plans[0] if result.transfer_plans else None
+        players_out_ids = set(first_plan.transfers_out) if first_plan else set()
+        players_in_ids = set(first_plan.transfers_in) if first_plan else set()
+
+        # Calculate projected squad for next GW
+        projected_squad_ids = list(set(current_player_ids) - players_out_ids | players_in_ids)
+        projected_squad_players = [p for p in all_players if p.id in projected_squad_ids]
+
+        # Get team stats
+        bank = my_team['entry_history']['bank'] / 10
+        team_value = my_team['entry_history']['value'] / 10
+
+        # Generate chip recommendations (same as my-team)
+        is_first_half = current_gw <= 19
+        chip_recommendations = []
+
+        # Wildcard
+        if 'Wildcard' in [c.name for c in available_chips]:
+            if is_first_half:
+                if current_gw < 16:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Wildcard",
+                        recommended_gameweek=17,
+                        reasoning="Use during winter fixture congestion to overhaul your squad (resets at GW20)",
+                        priority=2
+                    ))
+            else:
+                if current_gw < 34:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Wildcard",
+                        recommended_gameweek=34,
+                        reasoning="Use before DGW to prepare for Bench Boost and maximize fixture coverage",
+                        priority=1
+                    ))
+
+        # Free Hit
+        if 'Free Hit' in [c.name for c in available_chips]:
+            if is_first_half:
+                chip_recommendations.append(ChipRecommendation(
+                    chip_name="Free Hit",
+                    recommended_gameweek=18,
+                    reasoning="Use on a blank or difficult gameweek (resets at GW20)",
+                    priority=3
+                ))
+            else:
+                if current_gw < 25:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Free Hit",
+                        recommended_gameweek=25,
+                        reasoning="Use on blank gameweek when many teams don't play",
+                        priority=3
+                    ))
+                else:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Free Hit",
+                        recommended_gameweek=None,
+                        reasoning="Save for an upcoming blank or double gameweek",
+                        priority=3
+                    ))
+
+        # Bench Boost
+        if 'Bench Boost' in [c.name for c in available_chips]:
+            if is_first_half:
+                chip_recommendations.append(ChipRecommendation(
+                    chip_name="Bench Boost",
+                    recommended_gameweek=17,
+                    reasoning="Use when your full squad has favorable fixtures (resets at GW20)",
+                    priority=3
+                ))
+            else:
+                if current_gw < 32:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Bench Boost",
+                        recommended_gameweek=36,
+                        reasoning="Use on a double gameweek when all 15 players have good fixtures",
+                        priority=1
+                    ))
+                else:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Bench Boost",
+                        recommended_gameweek=37,
+                        reasoning="Use on remaining double gameweek with full team coverage",
+                        priority=1
+                    ))
+
+        # Triple Captain
+        if 'Triple Captain' in [c.name for c in available_chips]:
+            if is_first_half:
+                chip_recommendations.append(ChipRecommendation(
+                    chip_name="Triple Captain",
+                    recommended_gameweek=18,
+                    reasoning="Use when your premium player has an excellent fixture (resets at GW20)",
+                    priority=3
+                ))
+            else:
+                if current_gw < 32:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Triple Captain",
+                        recommended_gameweek=36,
+                        reasoning="Use on a DGW when your premium player has two great fixtures",
+                        priority=2
+                    ))
+                else:
+                    chip_recommendations.append(ChipRecommendation(
+                        chip_name="Triple Captain",
+                        recommended_gameweek=None,
+                        reasoning="Use when your captain has a double gameweek",
+                        priority=2
+                    ))
+
+        chip_recommendations.sort(key=lambda x: x.priority)
+
+        # Convert chip enums to strings
+        chips_available_strs = []
+        if Chip.WILDCARD in available_chips:
+            chips_available_strs.append('Wildcard')
+        if Chip.FREE_HIT in available_chips:
+            chips_available_strs.append('Free Hit')
+        if Chip.BENCH_BOOST in available_chips:
+            chips_available_strs.append('Bench Boost')
+        if Chip.TRIPLE_CAPTAIN in available_chips:
+            chips_available_strs.append('Triple Captain')
+
+        return MyTeamResponse(
+            team_name=my_info['name'],
+            team_value=team_value,
+            bank=bank,
+            free_transfers=free_transfers,
+            current_gameweek=current_gw + 1,  # Show NEXT gameweek
+            chips_available=chips_available_strs,
+            chip_recommendations=chip_recommendations,
+            players=[
+                PlayerResponse(
+                    id=p.id,
+                    name=p.name,
+                    team_id=p.team_id,
+                    position_name=p.position_name,
+                    cost=p.cost,
+                    cost_millions=p.cost_millions,
+                    total_points=p.total_points,
+                    form=p.form,
+                    selected_by_percent=p.selected_by_percent,
+                    is_available=p.is_available
+                )
+                for p in projected_squad_players
+            ],
+            starting_11_ids=new_squad.starting_11_ids,
+            captain_id=new_squad.captain_id,
+            vice_captain_id=new_squad.vice_captain_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/optimize", response_model=OptimizedSquadResponse)
 async def optimize_squad(budget: float = 100.0, objective: str = "points"):
     """Optimize squad selection."""
@@ -462,6 +725,15 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
         all_players = [Player(**p) for p in bootstrap['elements']]
         players_dict = {p.id: p for p in all_players}
 
+        # CRITICAL: For transfers, include current squad players even if injured
+        # (they're already in your team), but exclude unavailable players for new transfers
+        current_squad_players = [p for p in all_players if p.id in current_player_ids]
+        available_for_transfer = [p for p in all_players if p.is_available]
+
+        # Combine: current squad + available players (remove duplicates)
+        all_player_ids = set([p.id for p in current_squad_players] + [p.id for p in available_for_transfer])
+        optimization_players = [p for p in all_players if p.id in all_player_ids]
+
         # Get fixtures and teams for xP calculation
         current_gw = fpl_client.get_current_gameweek()
         fixtures_data = fpl_client.get_fixtures()
@@ -469,13 +741,57 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
         teams = {t.id: t for t in teams_data}
         fixtures = [Fixture(**f) for f in fixtures_data]
 
-        # Run new optimizer with multi-GW planning
+        # Get available chips and convert to Chip enum
+        chips_used = my_history.get('chips', [])
+        available_chips = []
+        chip_name_map = {
+            'wildcard': Chip.WILDCARD,
+            'freehit': Chip.FREE_HIT,
+            'bboost': Chip.BENCH_BOOST,
+            '3xc': Chip.TRIPLE_CAPTAIN
+        }
+
+        if not any(c['name'] == 'wildcard' for c in chips_used):
+            available_chips.append(Chip.WILDCARD)
+        if not any(c['name'] == 'freehit' for c in chips_used):
+            available_chips.append(Chip.FREE_HIT)
+        if not any(c['name'] == 'bboost' for c in chips_used):
+            available_chips.append(Chip.BENCH_BOOST)
+        if not any(c['name'] == '3xc' for c in chips_used):
+            available_chips.append(Chip.TRIPLE_CAPTAIN)
+
+        # Determine planning horizon based on chip timing
+        # If Bench Boost or Triple Captain coming soon, extend horizon to include that GW
+        horizon_weeks = 2  # Default
+        chip_gws = []
+
+        if Chip.BENCH_BOOST in available_chips:
+            # Bench Boost recommended in GW17 (first half) or GW36 (second half)
+            bb_gw = 17 if current_gw <= 19 else 36
+            if bb_gw > current_gw:
+                chip_gws.append(bb_gw)
+
+        if Chip.TRIPLE_CAPTAIN in available_chips:
+            # Triple Captain for best fixtures or DGWs
+            tc_gw = 18 if current_gw <= 19 else 36
+            if tc_gw > current_gw:
+                chip_gws.append(tc_gw)
+
+        # Extend horizon to include chip gameweeks (up to 5 weeks max)
+        if chip_gws:
+            max_chip_gw = max(chip_gws)
+            weeks_until_chip = max_chip_gw - current_gw
+            horizon_weeks = min(weeks_until_chip + 1, 5)  # Plan through chip GW, max 5 weeks
+
+        # Run new optimizer with chip-aware planning
+        # Use optimization_players (current squad + available for transfer)
         config = OptimizationConfig(
-            horizon_weeks=2,  # Look ahead 2 weeks
+            horizon_weeks=horizon_weeks,  # Extended for chip preparation
             free_transfers=free_transfers,
-            max_transfers=num_transfers  # Force specific number of transfers if provided
+            max_transfers=num_transfers,  # Force specific number of transfers if provided
+            available_chips=available_chips  # Pass available chips to optimizer
         )
-        optimizer = FPLOptimizer(all_players, fixtures, teams)
+        optimizer = FPLOptimizer(optimization_players, fixtures, teams)
         result = optimizer.optimize_with_transfers(
             current_player_ids,
             config=config
@@ -558,7 +874,7 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
 
             return fixture_list
 
-        # Build transfer suggestions
+        # Build transfer suggestions with player stats
         transfers = []
         for out_id, in_id in zip(sorted(players_out_ids), sorted(players_in_ids)):
             player_out = players_dict[out_id]
@@ -568,19 +884,33 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
             player_out_fixtures = get_player_fixtures(player_out.id, player_out.team_id)
             player_in_fixtures = get_player_fixtures(player_in.id, player_in.team_id)
 
+            # Calculate expected points for both players
+            player_out_xp = optimizer._get_xp(player_out.id, next_gw)
+            player_in_xp = optimizer._get_xp(player_in.id, next_gw)
+            points_gain = player_in_xp - player_out_xp
+
             transfers.append(
                 TransferSuggestion(
                     player_out_id=out_id,
                     player_out_name=player_out.name,
                     player_out_position=player_out.position_name,
+                    player_out_team=teams[player_out.team_id].short_name,
                     player_out_cost=player_out.cost_millions,
+                    player_out_total_points=player_out.total_points,
+                    player_out_form=player_out.form,
+                    player_out_expected_points=player_out_xp,
                     player_out_fixtures=player_out_fixtures,
                     player_in_id=in_id,
                     player_in_name=player_in.name,
                     player_in_position=player_in.position_name,
+                    player_in_team=teams[player_in.team_id].short_name,
                     player_in_cost=player_in.cost_millions,
+                    player_in_total_points=player_in.total_points,
+                    player_in_form=player_in.form,
+                    player_in_expected_points=player_in_xp,
                     player_in_fixtures=player_in_fixtures,
-                    cost_change=player_in.cost_millions - player_out.cost_millions
+                    cost_change=player_in.cost_millions - player_out.cost_millions,
+                    points_gain=points_gain
                 )
             )
 
@@ -596,8 +926,10 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
         predictor = ExpectedPointsPredictor(all_players, teams, fixtures)
 
         # Calculate captain scores for NEXT gameweek
+        # CRITICAL: Only consider players in the starting 11 (not bench)
+        starting_11_players = [p for p in final_squad_players if p.id in new_squad.starting_11_ids]
         captain_scores = []
-        for player in final_squad_players[:11]:  # Only starting 11
+        for player in starting_11_players:
             expected_pts = predictor.calculate_expected_points(player, next_gw, num_gameweeks=1)
             captain_value = expected_pts * 2
 
@@ -633,6 +965,26 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
         captain_pick = captain_scores[0] if len(captain_scores) > 0 else None
         vice_captain_pick = captain_scores[1] if len(captain_scores) > 1 else None
 
+        # Calculate optimal bench order (positions 12-15)
+        # Bench should be ordered by expected points to maximize autosub value
+        bench_players = [p for p in final_squad_players if p.id not in new_squad.starting_11_ids]
+
+        # Calculate xP for each bench player
+        bench_with_xp = []
+        for player in bench_players:
+            xp = optimizer._get_xp(player.id, next_gw)
+            bench_with_xp.append((player, xp))
+
+        # Sort bench by xP (highest first) - GK must be last per FPL rules
+        goalkeepers = [(p, xp) for p, xp in bench_with_xp if p.position_name == 'GKP']
+        outfield = [(p, xp) for p, xp in bench_with_xp if p.position_name != 'GKP']
+
+        # Sort outfield by xP (highest first)
+        outfield.sort(key=lambda x: x[1], reverse=True)
+
+        # Bench order: outfield players by xP, then GK
+        bench_order = [p.id for p, _ in outfield] + [p.id for p, _ in goalkeepers]
+
         return TransferRecommendationResponse(
             free_transfers=free_transfers,
             num_transfers=actual_transfers,
@@ -642,7 +994,8 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
             recommendation=recommendation,
             transfers=transfers,
             captain_pick=captain_pick,
-            vice_captain_pick=vice_captain_pick
+            vice_captain_pick=vice_captain_pick,
+            bench_order=bench_order
         )
 
     except Exception as e:

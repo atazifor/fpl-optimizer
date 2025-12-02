@@ -1209,15 +1209,9 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
             ownership=player.selected_by_percent,
         )
 
-        # Base form
-        if player.form > 0:
-            base = float(player.form)
-        elif player.points_per_game > 0:
-            base = player.points_per_game
-        else:
-            # Fallback to season average
-            estimated_games = max(player.minutes // 90, 1) if player.minutes > 0 else 1
-            base = player.total_points / estimated_games if estimated_games > 0 else 0.0
+        # IMPROVED: Blend form with season-long quality
+        # This prevents overweighting short-term form over proven performance
+        base = self._calculate_baseline(player)
 
         total = 0.0
 
@@ -1247,6 +1241,108 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
         breakdown.differential_value = total  # No adjustment without ownership
 
         return breakdown
+
+    def _calculate_baseline(self, player: Player) -> float:
+        """
+        Calculate baseline expected points using multiple quality indicators.
+
+        Prevents irrational decisions like:
+        - Benching Timber (74 pts, 2.7 form) for Wan-Bissaka (17 pts, 3.2 form)
+        - Starting Kroupi Jr (33pts, 200 mins) over Isak (19pts, 800 mins)
+
+        Uses: playing time, form, season quality, expected stats, team quality, price, consistency
+        """
+        # Calculate season-long points per 90 (quality baseline)
+        season_quality = 0.0
+        if player.minutes >= 90:
+            # Points per 90 minutes played
+            season_quality = (player.total_points / player.minutes) * 90
+
+        # Get recent form (last 3-5 games)
+        form = player.form if player.form > 0 else 0.0
+
+        # Get expected stats if available (xG, xA from FPL API)
+        expected_contribution = 0.0
+        if hasattr(player, 'expected_goals') and hasattr(player, 'expected_assists'):
+            try:
+                xg = float(player.expected_goals) if player.expected_goals else 0.0
+                xa = float(player.expected_assists) if player.expected_assists else 0.0
+                if player.minutes >= 90:
+                    # xG/xA per 90
+                    xg_per_90 = (xg / player.minutes) * 90
+                    xa_per_90 = (xa / player.minutes) * 90
+                    # Convert to points (rough): goals worth more than assists
+                    goal_points = {'GKP': 6, 'DEF': 6, 'MID': 5, 'FWD': 4}.get(player.position_name, 4)
+                    expected_contribution = (xg_per_90 * goal_points) + (xa_per_90 * 3)
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+        # Playing time reliability factor
+        games_played = player.minutes / 90 if player.minutes > 0 else 0
+
+        # CRITICAL: Penalize bench fodder (low minutes) when comparing to regular starters
+        # Kroupi Jr might have 33pts in 200 mins = 14.9 pts/90 (amazing!)
+        # But Isak has 19pts in 800 mins = 2.1 pts/90 (poor but he's a starter)
+        # We should heavily discount Kroupi Jr's inflated per-90 stats
+        reliability_factor = 1.0
+        if games_played < 3:
+            reliability_factor = 0.5  # Very limited minutes = 50% discount
+        elif games_played < 5:
+            reliability_factor = 0.7  # Some rotation = 30% discount
+        elif games_played < 8:
+            reliability_factor = 0.85  # Occasional starter = 15% discount
+        # else: games_played >= 8 = regular starter, no discount
+
+        # Apply reliability discount to season_quality
+        if season_quality > 0:
+            season_quality *= reliability_factor
+
+        if games_played < 3:
+            # Limited data: heavily weight position baseline, some form
+            position_baseline = {
+                'GKP': 2.5,
+                'DEF': 3.0,
+                'MID': 3.5,
+                'FWD': 3.5
+            }.get(player.position_name, 3.0)
+
+            # Reduce confidence in low-minute players
+            return position_baseline * 0.7 if games_played < 2 else position_baseline
+
+        elif games_played < 10:
+            # Some data: blend season average with form
+            # 50% season, 50% form
+            if season_quality > 0:
+                return 0.5 * season_quality + 0.5 * form
+            else:
+                return form if form > 0 else 2.5
+
+        else:
+            # Substantial data: smart blend with quality floor
+            if season_quality > 0 and form > 0:
+                # Weight: 40% season quality, 60% recent form
+                # This allows form to matter but prevents ignoring proven performers
+                blended = 0.4 * season_quality + 0.6 * form
+
+                # QUALITY FLOOR: Elite players (4+ pts/90) shouldn't drop below 60% of season average
+                # This prevents Timber (4.5 pts/90) being benched for Wan-Bissaka (1.3 pts/90)
+                if season_quality >= 4.0:
+                    quality_floor = season_quality * 0.6
+                    blended = max(blended, quality_floor)
+
+                return blended
+
+            elif season_quality > 0:
+                # No form data, use season average
+                return season_quality
+
+            elif form > 0:
+                # No season data (shouldn't happen), use form
+                return form
+
+            else:
+                # Fallback: points per game
+                return player.points_per_game if player.points_per_game > 0 else 2.5
 
 
 # =============================================================================
