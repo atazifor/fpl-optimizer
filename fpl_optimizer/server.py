@@ -3,13 +3,17 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
+import logging
 
 from .fpl_client import FPLClient
 from .models import Player, Team, Fixture, SquadConstraints
 from .optimizer import FPLOptimizer, OptimizationConfig, Chip
-from .predictor import ExpectedPointsPredictor
+from .expected_points import ExpectedPointsPredictor, PlayerStats, TeamStrength  # Compatibility wrapper
+from .data_cache import DataCache
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FPL Optimizer API")
 
@@ -115,9 +119,13 @@ class TransferRecommendationResponse(BaseModel):
     free_transfers: int
     num_transfers: int
     transfer_cost: int
-    expected_gain: float
-    net_gain: float
+    expected_gain: float  # Next gameweek only
+    net_gain: float  # Next gameweek only (expected_gain - transfer_cost)
+    horizon_expected_gain: float  # Total over planning horizon
+    horizon_net_gain: float  # Total over planning horizon (horizon_expected_gain - transfer_cost)
+    planning_horizon_weeks: int  # Number of weeks planned ahead
     recommendation: str  # "make_transfers", "wait", "not_worth_it"
+    reasoning: str  # Why this plan was chosen (e.g., "Sets up for GW17 Bench Boost")
     transfers: List[TransferSuggestion]
     captain_pick: Optional[CaptainOption] = None
     vice_captain_pick: Optional[CaptainOption] = None
@@ -126,6 +134,10 @@ class TransferRecommendationResponse(BaseModel):
 
 # Global client (reuse across requests)
 client = None
+# Global cache for advanced stats
+cached_player_stats: Optional[Dict[int, PlayerStats]] = None
+cached_team_strength: Optional[Dict[int, TeamStrength]] = None
+cache_loaded = False
 
 
 def get_client():
@@ -134,6 +146,47 @@ def get_client():
     if client is None:
         client = FPLClient()
     return client
+
+
+def load_advanced_stats() -> tuple[Optional[Dict[int, PlayerStats]], Optional[Dict[int, TeamStrength]]]:
+    """
+    Load advanced stats from cache if available.
+
+    Returns cached player stats and team strength, or (None, None) if not available.
+    Uses FPL_ADVANCED_MODE env variable to enable/disable (default: enabled).
+    """
+    global cached_player_stats, cached_team_strength, cache_loaded
+
+    # Check if already loaded
+    if cache_loaded:
+        return cached_player_stats, cached_team_strength
+
+    # Check if advanced mode is enabled (default: yes)
+    advanced_mode_enabled = os.getenv('FPL_ADVANCED_MODE', 'true').lower() == 'true'
+
+    if not advanced_mode_enabled:
+        logger.info("Advanced mode disabled via FPL_ADVANCED_MODE=false")
+        cache_loaded = True
+        return None, None
+
+    try:
+        cache = DataCache()
+        cached_player_stats = cache.load_player_stats()
+        cached_team_strength = cache.load_team_strength()
+
+        if cached_player_stats and cached_team_strength:
+            logger.info(f"Loaded advanced stats from cache: {len(cached_player_stats)} players, {len(cached_team_strength)} teams")
+        else:
+            logger.info("No valid cache found - using FPL data only")
+            logger.info("Run 'python scripts/fetch_external_data.py' to enable advanced predictions")
+
+        cache_loaded = True
+        return cached_player_stats, cached_team_strength
+
+    except Exception as e:
+        logger.error(f"Failed to load advanced stats cache: {e}")
+        cache_loaded = True
+        return None, None
 
 
 @app.get("/")
@@ -840,10 +893,71 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
         expected_gain = new_squad.expected_points - current_squad_xp
         net_gain = expected_gain - transfer_cost
 
-        # Determine recommendation
-        if net_gain > 2:
+        # HORIZON CALCULATIONS: Calculate total gain over planning horizon
+        # The optimizer already calculated this - use result.total_expected_points
+        # We need to calculate current squad's expected over the same horizon
+        current_squad_horizon_xp = 0
+        for week_offset in range(horizon_weeks):
+            gw = current_gw + week_offset
+            week_xp = sum(optimizer._get_xp(p.id, gw) for p in current_players[:11])
+            # Add captain bonus
+            week_captain_xp = max([optimizer._get_xp(p.id, gw) for p in current_players[:11]], default=0)
+            week_xp += week_captain_xp
+            # Apply decay for future weeks (same as optimizer)
+            decay = config.decay_rate ** week_offset
+            current_squad_horizon_xp += week_xp * decay
+
+        # Horizon gain includes the full planning period
+        horizon_expected_gain = result.total_expected_points - current_squad_horizon_xp + transfer_cost  # Add back transfer cost since optimizer subtracted it
+        horizon_net_gain = horizon_expected_gain - transfer_cost
+
+        # Generate reasoning based on chip planning and transfer value
+        reasoning_parts = []
+
+        # Check if planning for chip
+        planning_for_chip = False
+        if horizon_net_gain > net_gain + 5 and chip_gws:  # Significantly better horizon gain
+            chip_gw = max(chip_gws)
+            if Chip.BENCH_BOOST in available_chips and chip_gw == (17 if current_gw <= 19 else 36):
+                reasoning_parts.append(f"Sets up squad for GW{chip_gw} Bench Boost")
+                planning_for_chip = True
+            if Chip.TRIPLE_CAPTAIN in available_chips and chip_gw == (18 if current_gw <= 19 else 36):
+                reasoning_parts.append(f"Prepares for GW{chip_gw} Triple Captain")
+                planning_for_chip = True
+
+        # Explain hit context
+        if actual_transfers > free_transfers:
+            hits = actual_transfers - free_transfers
+            # With escalating penalty, calculate actual cost
+            total_hit_cost = 0
+            for hit_num in range(1, hits + 1):
+                hit_cost = 4 * (1.5 ** (hit_num - 1))
+                total_hit_cost += hit_cost
+
+            if planning_for_chip and horizon_net_gain > transfer_cost:
+                reasoning_parts.append(f"{hits} hit{'s' if hits > 1 else ''} (-{int(total_hit_cost)}pts) justified for chip prep")
+            elif net_gain > transfer_cost:
+                reasoning_parts.append(f"{hits} hit{'s' if hits > 1 else ''} (-{int(total_hit_cost)}pts) worth it for +{net_gain:.1f}pts gain")
+            else:
+                reasoning_parts.append(f"{hits} hit{'s' if hits > 1 else ''} (-{int(total_hit_cost)}pts) NOT recommended")
+
+        if not reasoning_parts:
+            if net_gain > 5:
+                reasoning_parts.append("Strong immediate gain")
+            elif net_gain > 0:
+                reasoning_parts.append("Modest improvement")
+            else:
+                reasoning_parts.append("Hold transfers for next week")
+
+        reasoning = "; ".join(reasoning_parts)
+
+        # Determine recommendation based on HORIZON gain (not just next GW)
+        # This accounts for chip preparation value
+        if horizon_net_gain > 5:
             recommendation = "make_transfers"
-        elif net_gain >= 0:
+        elif horizon_net_gain > 0 and net_gain > 0:
+            recommendation = "make_transfers"
+        elif horizon_net_gain >= 0:
             recommendation = "wait"
         else:
             recommendation = "not_worth_it"
@@ -991,7 +1105,11 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
             transfer_cost=transfer_cost,
             expected_gain=expected_gain,
             net_gain=net_gain,
+            horizon_expected_gain=horizon_expected_gain,
+            horizon_net_gain=horizon_net_gain,
+            planning_horizon_weeks=horizon_weeks,
             recommendation=recommendation,
+            reasoning=reasoning,
             transfers=transfers,
             captain_pick=captain_pick,
             vice_captain_pick=vice_captain_pick,
@@ -1033,7 +1151,8 @@ async def get_captain_picks():
         # Calculate captain scores for NEXT gameweek
         captain_scores = []
         for player in squad_players:
-            expected_pts = predictor.calculate_expected_points(player, next_gw, num_gameweeks=1)
+            # Use captain_mode=True to prioritize proven quality over form
+            expected_pts = predictor.calculate_expected_points(player, next_gw, num_gameweeks=1, captain_mode=True)
             captain_value = expected_pts * 2
 
             # Get fixture for NEXT gameweek

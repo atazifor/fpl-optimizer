@@ -32,7 +32,8 @@ class ExpectedPointsPredictor:
         self,
         player: Player,
         gameweek: int,
-        num_gameweeks: int = 1
+        num_gameweeks: int = 1,
+        captain_mode: bool = False
     ) -> float:
         """
         Calculate expected points for a player over next N gameweeks.
@@ -41,6 +42,7 @@ class ExpectedPointsPredictor:
             player: Player to calculate for
             gameweek: Starting gameweek
             num_gameweeks: Number of gameweeks to predict
+            captain_mode: If True, prioritize proven quality over form
 
         Returns:
             Expected points
@@ -54,8 +56,8 @@ class ExpectedPointsPredictor:
         if not player_fixtures:
             return 0.0
 
-        # Base expected points from form
-        form_points = self._calculate_form_points(player)
+        # Base expected points from form (with captain mode consideration)
+        form_points = self._calculate_form_points(player, captain_mode=captain_mode)
 
         # Adjust for fixture difficulty
         fixture_adjusted_points = 0.0
@@ -75,31 +77,114 @@ class ExpectedPointsPredictor:
 
         return round(expected, 2)
 
-    def _calculate_form_points(self, player: Player) -> float:
+    def _calculate_form_points(self, player: Player, captain_mode: bool = False) -> float:
         """
-        Calculate base expected points from player's form.
+        Calculate base expected points from player's underlying stats and form.
 
-        Uses weighted average of recent points, with more weight on recent games.
+        PREDICTIVE APPROACH: Uses expected stats (xG, xA) rather than actual points.
+        This allows the model to identify undervalued players BEFORE they haul.
 
         Args:
             player: Player to calculate form for
+            captain_mode: If True, prioritize proven quality over form
 
         Returns:
-            Expected points per game based on form
+            Expected points per game based on underlying stats
         """
-        # Use the form field which is already a weighted average
-        if player.form > 0:
-            return float(player.form)
+        # CRITICAL: Use EXPECTED stats (predictive) not actual points (reactive)
+        # This is what allows us to find Bruno Fernandes BEFORE he hauls
 
-        # Fallback to points per game if form not available
-        if player.points_per_game > 0:
+        # Convert expected stats to points per game
+        # expected_goals/assists are cumulative season totals
+        games_played = player.minutes / 90 if player.minutes > 0 else 0
+
+        if games_played < 0.5:  # Less than half a game played
+            return 0.0
+
+        # Calculate expected points per 90 from underlying stats
+        xg_per_90 = (player.expected_goals / games_played) if games_played > 0 else 0
+        xa_per_90 = (player.expected_assists / games_played) if games_played > 0 else 0
+
+        # Points per 90 from expected stats
+        # Goals: 4-6pts depending on position
+        # Assists: 3pts
+        # Appearance: 2pts
+        # Plus bonus/clean sheets estimates
+
+        goal_points = xg_per_90 * (6 if player.position in [1, 2] else 5 if player.position == 3 else 4)
+        assist_points = xa_per_90 * 3
+        appearance_points = 2.0  # Assume full game
+
+        # Estimate bonus points (correlated with goal involvements)
+        bonus_estimate = (xg_per_90 + xa_per_90) * 0.5  # Rough estimate
+
+        # Clean sheet points for defenders/keepers
+        cs_points = 0.0
+        if player.position in [1, 2]:  # GKP or DEF
+            cs_probability = self._estimate_clean_sheet_probability(player)
+            cs_points = cs_probability * (4 if player.position == 1 else 4)
+
+        # Base expected from underlying stats
+        underlying_xp = goal_points + assist_points + appearance_points + bonus_estimate + cs_points
+
+        # Get actual form for comparison
+        form = player.form if player.form > 0 else 0.0
+
+        # Apply reliability discount based on sample size
+        reliability_factor = 1.0
+        if games_played < 3:
+            reliability_factor = 0.6  # Low confidence
+        elif games_played < 5:
+            reliability_factor = 0.8
+        elif games_played < 8:
+            reliability_factor = 0.9
+
+        underlying_xp *= reliability_factor
+
+        # For players with substantial data, blend underlying stats with recent form
+        if games_played >= 10 and underlying_xp > 0 and form > 0:
+            # CAPTAIN MODE: Prioritize underlying quality over recent form
+            if captain_mode:
+                if underlying_xp >= 7.0:
+                    # Elite players: 90% underlying, 10% form for captain
+                    blended = 0.90 * underlying_xp + 0.10 * form
+                elif underlying_xp >= 5.0:
+                    # Good players: 70% underlying, 30% form
+                    blended = 0.70 * underlying_xp + 0.30 * form
+                else:
+                    # Average: 50/50
+                    blended = 0.50 * underlying_xp + 0.50 * form
+            else:
+                # NORMAL MODE: Blend underlying stats with form
+                if underlying_xp >= 7.0:
+                    blended = 0.70 * underlying_xp + 0.30 * form
+                elif underlying_xp >= 5.0:
+                    blended = 0.50 * underlying_xp + 0.50 * form
+                else:
+                    # Recent form matters more for average players
+                    blended = 0.40 * underlying_xp + 0.60 * form
+
+            # Quality floor - don't drop too far below underlying stats
+            if underlying_xp >= 4.0:
+                blended = max(blended, underlying_xp * 0.6)
+
+            # Form spike protection - don't overvalue temporary hot streaks
+            if form > underlying_xp * 1.5:
+                blended = min(blended, underlying_xp * 1.3)
+
+            return blended
+        elif underlying_xp > 0:
+            # Use underlying stats if available
+            return underlying_xp
+        elif form > 0:
+            # Fall back to form
+            return form
+        elif player.points_per_game > 0:
             return player.points_per_game
-
-        # Last resort: use total points averaged over season
-        # Assume ~15 games played at midseason
-        if player.total_points > 0:
+        else:
+            # Last resort: estimate from total points
             estimated_games = max(player.minutes // 90, 1)
-            return player.total_points / estimated_games
+            return player.total_points / estimated_games if estimated_games > 0 else 0.0
 
         return 0.0
 
@@ -153,8 +238,9 @@ class ExpectedPointsPredictor:
                 else opponent.strength_defence_away
             )
             # Weaker defense = easier to score against = higher multiplier
-            # Scale: 1 (weakest) to 5 (strongest) -> 1.4 to 0.6 multiplier
-            multiplier = 1.0 + (3 - opponent_strength) * 0.2
+            # REDUCED: Scale from 1 (weakest) to 5 (strongest) -> 1.1 to 0.9 multiplier (±10%)
+            # This prevents over-weighting fixtures vs player quality
+            multiplier = 1.0 + (3 - opponent_strength) * 0.05
 
         # For defensive players (GKP, DEF), look at opponent's attacking strength
         elif player.position in [1, 2]:  # GKP or DEF
@@ -163,7 +249,8 @@ class ExpectedPointsPredictor:
                 else opponent.strength_attack_away
             )
             # Weaker attack = easier to keep clean sheet = higher multiplier
-            multiplier = 1.0 + (3 - opponent_strength) * 0.2
+            # REDUCED: ±10% instead of ±40% to not override player quality
+            multiplier = 1.0 + (3 - opponent_strength) * 0.05
 
         else:
             multiplier = 1.0
@@ -178,6 +265,44 @@ class ExpectedPointsPredictor:
 
         # Clamp between 0.6 and 1.4
         return max(0.6, min(1.4, multiplier))
+
+    def _estimate_clean_sheet_probability(self, player: Player) -> float:
+        """
+        Estimate clean sheet probability for a defender/goalkeeper.
+
+        Uses team's defensive strength and expected goals conceded.
+
+        Args:
+            player: Player to estimate for
+
+        Returns:
+            Probability of clean sheet (0.0 to 1.0)
+        """
+        team = self.teams.get(player.team_id)
+        if not team:
+            return 0.25  # Default 25% chance
+
+        # Use expected goals conceded per 90 minutes
+        games_played = player.minutes / 90 if player.minutes > 0 else 0
+        if games_played < 1:
+            return 0.25
+
+        xgc_per_90 = player.expected_goals_conceded / games_played if games_played > 0 else 1.5
+
+        # Lower xGC = higher CS probability
+        # xGC of 0.5 per game -> ~60% CS probability
+        # xGC of 1.0 per game -> ~35% CS probability
+        # xGC of 1.5+ per game -> ~20% CS probability
+        if xgc_per_90 < 0.5:
+            return 0.60
+        elif xgc_per_90 < 0.75:
+            return 0.50
+        elif xgc_per_90 < 1.0:
+            return 0.35
+        elif xgc_per_90 < 1.5:
+            return 0.25
+        else:
+            return 0.15
 
     def _get_minutes_multiplier(self, player: Player) -> float:
         """
@@ -219,6 +344,8 @@ class ExpectedPointsPredictor:
         """
         Calculate expected points for a player as captain (points x2).
 
+        Uses captain_mode=True to prioritize proven quality over form.
+
         Args:
             player: Player to consider for captaincy
             gameweek: Gameweek number
@@ -226,7 +353,7 @@ class ExpectedPointsPredictor:
         Returns:
             Expected captain points (2x regular expected points)
         """
-        base_expected = self.calculate_expected_points(player, gameweek, num_gameweeks=1)
+        base_expected = self.calculate_expected_points(player, gameweek, num_gameweeks=1, captain_mode=True)
         return base_expected * 2
 
     def get_best_captain(

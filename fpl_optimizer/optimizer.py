@@ -13,6 +13,13 @@ from .expected_points import (
     create_calculator,
 )
 
+# Try to load ML model if available
+try:
+    from .ml_predictor import MLExpectedPointsPredictor
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+
 
 class ObjectiveType(Enum):
     """Optimization objective types."""
@@ -35,6 +42,7 @@ class OptimizationConfig:
     """Configuration for multi-gameweek optimization."""
     horizon_weeks: int = 2  # How many weeks to plan ahead
     transfer_penalty: int = 4  # Points cost per transfer
+    hit_escalation_penalty: float = 1.5  # ESCALATING penalty: -4 for 1st hit, -6 for 2nd hit, -9 for 3rd
     decay_rate: float = 0.9  # Future weeks are worth less
     min_expected_minutes: int = 60  # Filter out rotation risks
     max_ownership_differential: float = 10.0  # Max ownership % for differentials
@@ -108,7 +116,33 @@ class FPLOptimizer:
         self.fixtures = fixtures
         self.teams = teams
         self.constraints = constraints or SquadConstraints()
-        self.xp_calculator = xp_calculator or SimpleExpectedPointsCalculator()
+
+        # Try to use ML model if available and trained
+        # NOTE: ML model temporarily disabled due to overfitting with limited training data (9 GWs)
+        # Will re-enable when we have 20+ gameweeks of data for better generalization
+        if xp_calculator is None:
+            if False and ML_AVAILABLE:  # Temporarily disabled
+                try:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    ml_calc = MLExpectedPointsPredictor()
+                    ml_calc.load()  # Try to load trained model
+                    self.xp_calculator = ml_calc
+                    logger.info("✅ Using ML-powered expected points predictor")
+                    print("✅ Using ML-powered expected points predictor")
+                except Exception as e:
+                    # Fall back to simple calculator if ML model not found
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Failed to load ML model: {e}, falling back to simple calculator")
+                    self.xp_calculator = SimpleExpectedPointsCalculator()
+                    print(f"ℹ️  Using simple expected points calculator (failed to load ML: {e})")
+            else:
+                self.xp_calculator = SimpleExpectedPointsCalculator()
+                print("ℹ️  Using simple expected points calculator")
+        else:
+            self.xp_calculator = xp_calculator
+
         self.model = None
         self.player_vars = {}
         self._xp_cache: Dict[Tuple[int, int], float] = {}
@@ -236,11 +270,21 @@ class FPLOptimizer:
                 config=config
             )
 
-            # Calculate transfer cost
+            # Calculate transfer cost with ESCALATING penalty
+            # Makes multiple hits much more expensive:
+            # - 1 hit: -4 pts
+            # - 2 hits: -4 + -6 = -10 pts (not -8)
+            # - 3 hits: -4 + -6 + -9 = -19 pts (not -12)
             num_transfers = len(transfers_in)
             free_transfers = config.free_transfers if week_offset == 0 else 1
             hits = max(0, num_transfers - free_transfers)
-            transfer_cost = hits * config.transfer_penalty
+
+            # ESCALATING penalty calculation
+            transfer_cost = 0
+            for hit_num in range(1, hits + 1):
+                # Each successive hit costs more: base_cost * (escalation ^ (hit_num - 1))
+                hit_cost = config.transfer_penalty * (config.hit_escalation_penalty ** (hit_num - 1))
+                transfer_cost += hit_cost
 
             # Calculate expected points for this week
             week_expected = sum(

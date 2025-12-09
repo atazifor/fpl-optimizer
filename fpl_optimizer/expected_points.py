@@ -1171,14 +1171,55 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
     Use this when you don't have advanced stats (xG, xA).
     """
 
+    def __init__(
+        self,
+        elite_predictive_weight: float = 0.90,
+        elite_reactive_weight: float = 0.10,
+        good_predictive_weight: float = 0.80,
+        good_reactive_weight: float = 0.20,
+        avg_predictive_weight: float = 0.70,
+        avg_reactive_weight: float = 0.30,
+    ):
+        """
+        Initialize calculator with blend ratio parameters.
+
+        Args:
+            elite_predictive_weight: Weight for season quality (pts/90) for elite players (>=7 pts/90)
+            elite_reactive_weight: Weight for form for elite players
+            good_predictive_weight: Weight for season quality for good players (5-7 pts/90)
+            good_reactive_weight: Weight for form for good players
+            avg_predictive_weight: Weight for season quality for average players (<5 pts/90)
+            avg_reactive_weight: Weight for form for average players
+
+        Examples:
+            90/10 (very predictive): SimpleExpectedPointsCalculator(0.90, 0.10, 0.80, 0.20, 0.70, 0.30)
+            80/20 (balanced): SimpleExpectedPointsCalculator(0.80, 0.20, 0.70, 0.30, 0.60, 0.40)
+            70/30 (more reactive): SimpleExpectedPointsCalculator(0.70, 0.30, 0.50, 0.50, 0.40, 0.60)
+        """
+        self.elite_predictive = elite_predictive_weight
+        self.elite_reactive = elite_reactive_weight
+        self.good_predictive = good_predictive_weight
+        self.good_reactive = good_reactive_weight
+        self.avg_predictive = avg_predictive_weight
+        self.avg_reactive = avg_reactive_weight
+
     def calculate(
         self,
         player: Player,
         gameweek: int,
         fixtures: List[Fixture],
         teams: Dict[int, Team],
+        captain_mode: bool = False,
     ) -> ExpectedPointsBreakdown:
-        """Calculate expected points using basic FPL data."""
+        """Calculate expected points using basic FPL data.
+
+        Args:
+            player: Player to calculate points for
+            gameweek: Gameweek to predict
+            fixtures: All fixtures
+            teams: Team data
+            captain_mode: If True, prioritize proven quality over form for captain selection
+        """
 
         # Get player's fixtures
         player_fixtures = [
@@ -1211,7 +1252,20 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
 
         # IMPROVED: Blend form with season-long quality
         # This prevents overweighting short-term form over proven performance
-        base = self._calculate_baseline(player)
+        # In captain mode, we prioritize elite player quality even more heavily
+        base = self._calculate_baseline(player, captain_mode=captain_mode)
+
+        # Apply position-specific baseline caps BEFORE fixture adjustments
+        # Even elite defenders (e.g. 6.4 ppg) shouldn't have baselines >6.5
+        # as clean sheets + attacking returns are capped by role
+        position_baseline_caps = {
+            'GKP': 5.0,   # Keepers max base ~5 (mostly clean sheets + saves)
+            'DEF': 6.5,   # Defenders max base ~6.5 (clean sheets + occasional returns)
+            'MID': 10.0,  # Midfielders can have higher baselines
+            'FWD': 10.0,  # Forwards can have higher baselines
+        }
+        baseline_cap = position_baseline_caps.get(player.position_name, 8.0)
+        base = min(base, baseline_cap)
 
         total = 0.0
 
@@ -1234,15 +1288,31 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
             fixture_xp = base * diff_mult * home_mult
             total += fixture_xp
 
+        # Apply chance of playing multiplier (CRITICAL for injury-prone players)
+        if hasattr(player, 'chance_of_playing_next_round') and player.chance_of_playing_next_round is not None:
+            chance_mult = player.chance_of_playing_next_round / 100
+            total *= chance_mult
+
+        # Apply position-specific caps to prevent unrealistic predictions
+        # Based on historical FPL maximum realistic single-GW scores
+        position_caps = {
+            'GKP': 8.0,   # Keepers rarely score >8 in a single GW
+            'DEF': 10.0,  # Defenders max ~10 (clean sheet + goal + assists + bonus)
+            'MID': 15.0,  # Midfielders can haul bigger
+            'FWD': 15.0,  # Forwards can haul bigger
+        }
+        max_reasonable = position_caps.get(player.position_name, 12.0)
+        total = min(total, max_reasonable)
+
         breakdown.total_expected_points = round(total, 2)
         breakdown.confidence = 0.5  # Lower confidence without advanced stats
         breakdown.variance = 6.0  # Higher variance without detailed modeling
-        breakdown.ceiling, breakdown.floor = round(total + 6, 2), round(max(0, total - 4), 2)
+        breakdown.ceiling, breakdown.floor = round(min(total + 6, max_reasonable * 1.5), 2), round(max(0, total - 4), 2)
         breakdown.differential_value = total  # No adjustment without ownership
 
         return breakdown
 
-    def _calculate_baseline(self, player: Player) -> float:
+    def _calculate_baseline(self, player: Player, captain_mode: bool = False) -> float:
         """
         Calculate baseline expected points using multiple quality indicators.
 
@@ -1250,8 +1320,17 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
         - Benching Timber (74 pts, 2.7 form) for Wan-Bissaka (17 pts, 3.2 form)
         - Starting Kroupi Jr (33pts, 200 mins) over Isak (19pts, 800 mins)
 
+        Args:
+            player: Player to calculate baseline for
+            captain_mode: If True, heavily prioritize proven elite quality over form
+
         Uses: playing time, form, season quality, expected stats, team quality, price, consistency
         """
+        # CRITICAL: Filter out players with insufficient playing time
+        # Players with < 90 minutes have no reliable baseline
+        if player.minutes < 90:
+            return 0.0
+
         # Calculate season-long points per 90 (quality baseline)
         season_quality = 0.0
         if player.minutes >= 90:
@@ -1260,6 +1339,9 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
 
         # Get recent form (last 3-5 games)
         form = player.form if player.form > 0 else 0.0
+
+        # Playing time reliability factor (calculate early as it's used below)
+        games_played = player.minutes / 90 if player.minutes > 0 else 0
 
         # Get expected stats if available (xG, xA from FPL API)
         expected_contribution = 0.0
@@ -1271,14 +1353,25 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
                     # xG/xA per 90
                     xg_per_90 = (xg / player.minutes) * 90
                     xa_per_90 = (xa / player.minutes) * 90
-                    # Convert to points (rough): goals worth more than assists
+
+                    # Convert to points
                     goal_points = {'GKP': 6, 'DEF': 6, 'MID': 5, 'FWD': 4}.get(player.position_name, 4)
-                    expected_contribution = (xg_per_90 * goal_points) + (xa_per_90 * 3)
+                    assist_points = xa_per_90 * 3
+                    appearance_points = 2.0
+
+                    # Bonus estimate (correlated with goal involvements)
+                    bonus_estimate = (xg_per_90 + xa_per_90) * 0.5
+
+                    # Clean sheet points for defenders/keepers
+                    cs_points = 0.0
+                    if player.position_name in ('GKP', 'DEF'):
+                        # Rough estimate: good defenders/keepers get ~40% clean sheets
+                        cs_probability = 0.4 if games_played >= 5 else 0.3
+                        cs_points = cs_probability * 4
+
+                    expected_contribution = (xg_per_90 * goal_points) + assist_points + appearance_points + bonus_estimate + cs_points
             except (ValueError, TypeError, AttributeError):
                 pass
-
-        # Playing time reliability factor
-        games_played = player.minutes / 90 if player.minutes > 0 else 0
 
         # CRITICAL: Penalize bench fodder (low minutes) when comparing to regular starters
         # Kroupi Jr might have 33pts in 200 mins = 14.9 pts/90 (amazing!)
@@ -1318,26 +1411,67 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
                 return form if form > 0 else 2.5
 
         else:
-            # Substantial data: smart blend with quality floor
-            if season_quality > 0 and form > 0:
-                # Weight: 40% season quality, 60% recent form
-                # This allows form to matter but prevents ignoring proven performers
-                blended = 0.4 * season_quality + 0.6 * form
+            # Substantial data: PREDICT using season quality + blend with form
+            # Season quality (pts/90) already reflects xG/xA converted to actual points
+            # The predictive element comes from the 90/10 blend ratio, not from
+            # using incomplete expected_contribution
 
-                # QUALITY FLOOR: Elite players (4+ pts/90) shouldn't drop below 60% of season average
-                # This prevents Timber (4.5 pts/90) being benched for Wan-Bissaka (1.3 pts/90)
-                if season_quality >= 4.0:
-                    quality_floor = season_quality * 0.6
+            # Use season quality as baseline (it already incorporates xG/xA indirectly)
+            baseline_quality = season_quality if season_quality > 0 else expected_contribution
+
+            if baseline_quality > 0 and form > 0:
+                # Adaptive weighting based on player quality
+                # Elite players (>7 pts/90): trust underlying stats more (70% xP, 30% form)
+                # Good players (5-7 pts/90): balanced (50% xP, 50% form)
+                # Average players (<5 pts/90): trust form more (40% xP, 60% form)
+
+                # CAPTAIN MODE: For captain decisions, we care about ceiling not expected value
+                # Elite players have higher ceilings, so weight underlying quality even more heavily
+                if captain_mode:
+                    if baseline_quality >= 7.0:
+                        # Elite (Bruno, Salah): 90% underlying, 10% form for captain
+                        blended = 0.90 * baseline_quality + 0.10 * form
+                    elif baseline_quality >= 5.0:
+                        # Good players: 70% underlying, 30% form for captain
+                        blended = 0.70 * baseline_quality + 0.30 * form
+                    else:
+                        # Average players: 50% underlying, 50% form
+                        blended = 0.50 * baseline_quality + 0.50 * form
+                else:
+                    # NORMAL MODE: For team selection and lineup decisions
+                    # Use configurable blend ratios (set in __init__)
+                    if baseline_quality >= 7.0:
+                        # Elite players: use configured weights
+                        blended = self.elite_predictive * baseline_quality + self.elite_reactive * form
+                    elif baseline_quality >= 5.0:
+                        # Good players: use configured weights
+                        blended = self.good_predictive * baseline_quality + self.good_reactive * form
+                    else:
+                        # Average players: use configured weights
+                        blended = self.avg_predictive * baseline_quality + self.avg_reactive * form
+
+                # QUALITY FLOOR: Elite players (4+ xP/90) shouldn't drop below 60% of baseline
+                # This prevents high-xG players being undervalued during cold streaks
+                if baseline_quality >= 4.0:
+                    quality_floor = baseline_quality * 0.6
                     blended = max(blended, quality_floor)
+
+                # QUALITY CEILING: Form spikes shouldn't be taken at face value
+                # If form >> baseline, it's likely an outlier haul
+                # Cap baseline to prevent unrealistic expectations
+                if form > baseline_quality * 1.5:
+                    # Form is spiking (>1.5x baseline) - cap the upside
+                    # Allow some upside but not full spike value
+                    blended = min(blended, baseline_quality * 1.3)
 
                 return blended
 
-            elif season_quality > 0:
-                # No form data, use season average
-                return season_quality
+            elif baseline_quality > 0:
+                # No form data, use underlying stats or season average
+                return baseline_quality
 
             elif form > 0:
-                # No season data (shouldn't happen), use form
+                # No baseline data (shouldn't happen), use form
                 return form
 
             else:
@@ -1369,3 +1503,67 @@ def create_calculator(
     else:
         logger.info("Using simple xP calculator (FPL data only)")
         return SimpleExpectedPointsCalculator()
+
+
+# =============================================================================
+# Compatibility Wrapper (for migration from predictor.py)
+# =============================================================================
+
+class ExpectedPointsPredictor:
+    """
+    Compatibility wrapper around SimpleExpectedPointsCalculator.
+
+    Provides the same API as the old predictor.py for easier migration.
+    Use SimpleExpectedPointsCalculator directly for new code.
+    """
+
+    def __init__(
+        self,
+        players: List[Player],
+        teams: Dict[int, Team],
+        fixtures: List[Fixture]
+    ):
+        """
+        Initialize predictor with game data.
+
+        Args:
+            players: List of all players
+            teams: Dict mapping team ID to Team
+            fixtures: List of fixtures
+        """
+        self.players = {p.id: p for p in players}
+        self.teams = teams
+        self.fixtures = fixtures
+        self.calculator = SimpleExpectedPointsCalculator()
+
+    def calculate_expected_points(
+        self,
+        player: Player,
+        gameweek: int,
+        num_gameweeks: int = 1,
+        captain_mode: bool = False
+    ) -> float:
+        """
+        Calculate expected points for a player.
+
+        Args:
+            player: Player to calculate for
+            gameweek: Starting gameweek
+            num_gameweeks: Number of gameweeks (only 1 supported currently)
+            captain_mode: If True, prioritize quality over form
+
+        Returns:
+            Expected points
+        """
+        if num_gameweeks != 1:
+            logger.warning(f"num_gameweeks={num_gameweeks} not fully supported, using 1")
+
+        breakdown = self.calculator.calculate(
+            player=player,
+            gameweek=gameweek,
+            fixtures=self.fixtures,
+            teams=self.teams,
+            captain_mode=captain_mode
+        )
+
+        return breakdown.total_expected_points

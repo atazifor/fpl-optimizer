@@ -5,7 +5,7 @@ import argparse
 from typing import List, Optional
 from .fpl_client import FPLClient
 from .models import Player, Team, Fixture, SquadConstraints
-from .predictor import ExpectedPointsPredictor
+from .expected_points import ExpectedPointsPredictor
 from .optimizer import FPLOptimizer
 
 

@@ -21,6 +21,11 @@ class Player(BaseModel):
     selected_by_percent: float = 0.0
     form: float = 0.0
     minutes: int = 0
+    goals_scored: int = 0
+    assists: int = 0
+    clean_sheets: int = 0
+    goals_conceded: int = 0
+    bonus: int = 0
 
     # Expected stats
     expected_goals: float = Field(default=0.0, alias='expected_goals')
