@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import os
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from .fpl_client import FPLClient
 from .models import Player, Team, Fixture, SquadConstraints
@@ -233,10 +235,37 @@ async def get_my_team():
         fpl_client = get_client()
 
         # Fetch data
-        my_team = fpl_client.get_my_team()
         my_info = fpl_client.get_my_info()
         my_history = fpl_client.get_my_history()
         bootstrap = fpl_client.get_bootstrap_static()
+        current_gw = fpl_client.get_current_gameweek()
+
+        # Check if Free Hit was used in the current or any recent gameweek
+        chips_used = my_history.get('chips', [])
+
+        # Find the most recent Free Hit usage
+        free_hit_gw = None
+        for chip in chips_used:
+            if chip['name'] == 'freehit':
+                free_hit_gw = chip['event']
+
+        # Check if current GW is finished
+        events = bootstrap.get('events', [])
+        current_gw_data = next((e for e in events if e['id'] == current_gw), None)
+        is_gw_finished = current_gw_data and current_gw_data.get('finished', False)
+
+        # Determine which GW to fetch team data from
+        # After Free Hit GW ends, the team reverts to the state from the GW before Free Hit
+        # But we can't fetch future GW data, so:
+        # - If Free Hit was used in current GW and it's finished, fetch from GW before Free Hit
+        # - Otherwise, fetch current GW
+        if free_hit_gw == current_gw and is_gw_finished:
+            # Free Hit was used this GW and it's finished - team reverted to previous permanent state
+            # Fetch from the gameweek before Free Hit
+            my_team = fpl_client.get_my_team(gameweek=current_gw - 1)
+        else:
+            # Normal case: fetch current gameweek
+            my_team = fpl_client.get_my_team()
 
         # Get player IDs and captain info
         current_player_ids = [pick['element'] for pick in my_team['picks']]
@@ -287,9 +316,6 @@ async def get_my_team():
         else:
             # Default to 1 if not enough history
             free_transfers = 1
-
-        # Get current gameweek
-        current_gw = fpl_client.get_current_gameweek()
 
         # Get chips
         chips_used = my_history.get('chips', [])
@@ -449,11 +475,29 @@ async def get_next_gw_team(num_transfers: Optional[int] = None):
     try:
         fpl_client = get_client()
 
-        # Fetch data
-        my_team = fpl_client.get_my_team()
+        # Fetch basic data
         my_info = fpl_client.get_my_info()
         my_history = fpl_client.get_my_history()
         bootstrap = fpl_client.get_bootstrap_static()
+
+        # Check if Free Hit was used in the current gameweek
+        chips_used = my_history.get('chips', [])
+        free_hit_gw = None
+        for chip in chips_used:
+            if chip['name'] == 'freehit':
+                free_hit_gw = chip['event']
+
+        # Get current gameweek and check if it's finished
+        events = bootstrap.get('events', [])
+        current_gw = next((e['id'] for e in events if e['is_current']), None)
+        current_gw_data = next((e for e in events if e['id'] == current_gw), None)
+        is_gw_finished = current_gw_data and current_gw_data.get('finished', False)
+
+        # Fetch correct team data (reverted team if Free Hit was used in finished GW)
+        if free_hit_gw == current_gw and is_gw_finished:
+            my_team = fpl_client.get_my_team(gameweek=current_gw - 1)
+        else:
+            my_team = fpl_client.get_my_team()
 
         # Calculate free transfers
         current_gws = my_history['current']
@@ -748,9 +792,27 @@ async def get_transfer_recommendations(num_transfers: Optional[int] = None):
         fpl_client = get_client()
 
         # Fetch data
-        my_team = fpl_client.get_my_team()
         my_history = fpl_client.get_my_history()
         bootstrap = fpl_client.get_bootstrap_static()
+        current_gw = fpl_client.get_current_gameweek()
+
+        # Check if Free Hit was used in the current gameweek (same logic as my-team endpoint)
+        chips_used = my_history.get('chips', [])
+        free_hit_gw = None
+        for chip in chips_used:
+            if chip['name'] == 'freehit':
+                free_hit_gw = chip['event']
+
+        # Check if current GW is finished
+        events = bootstrap.get('events', [])
+        current_gw_data = next((e for e in events if e['id'] == current_gw), None)
+        is_gw_finished = current_gw_data and current_gw_data.get('finished', False)
+
+        # Fetch correct team data (reverted team if Free Hit was used in finished GW)
+        if free_hit_gw == current_gw and is_gw_finished:
+            my_team = fpl_client.get_my_team(gameweek=current_gw - 1)
+        else:
+            my_team = fpl_client.get_my_team()
 
         # Calculate free transfers (same logic as my-team endpoint)
         current_gws = my_history['current']
@@ -1328,6 +1390,257 @@ async def get_fixtures():
         return team_fixtures
 
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/free-hit-team", response_model=MyTeamResponse)
+async def get_free_hit_team(gameweek: Optional[int] = None):
+    """
+    Get optimal Free Hit team for next gameweek.
+
+    Free Hit allows unlimited transfers for one gameweek, so we build the best possible
+    team from scratch ignoring current squad.
+    """
+    try:
+        fpl_client = get_client()
+
+        # Fetch data
+        my_info = fpl_client.get_my_info()
+        my_history = fpl_client.get_my_history()
+        bootstrap = fpl_client.get_bootstrap_static()
+        fixtures_data = fpl_client.get_fixtures()
+
+        # Get all available players
+        all_players = [Player(**p) for p in bootstrap['elements']]
+        available_players = [p for p in all_players if p.is_available]
+
+        # For Free Hit, filter out bench warmers and non-attacking assets
+        # Use ownership as a data-driven proxy for attacking threat
+        filtered_players = []
+        for p in available_players:
+            if p.position_name == 'MID':
+                # Midfielders: require minimum ownership threshold (10%) to ensure attacking midfielders
+                # Premium players (>=£8.5m) can have lower ownership for differentials
+                # This filters out defensive mids and bench fodder
+                if p.selected_by_percent >= 10.0 or p.cost_millions >= 8.5:
+                    filtered_players.append(p)
+            else:
+                # Other positions: basic bench warmer filter
+                if p.cost_millions >= 4.5 or p.total_points >= 40:
+                    filtered_players.append(p)
+
+        available_players = filtered_players
+
+        # Get teams and fixtures
+        teams_data = [Team(**t) for t in bootstrap['teams']]
+        teams = {t.id: t for t in teams_data}
+        fixtures = [Fixture(**f) for f in fixtures_data]
+
+        # Get current gameweek
+        current_gw = fpl_client.get_current_gameweek()
+
+        # Free Hit is for NEXT gameweek
+        target_gw = current_gw + 1
+
+        # Get team stats
+        my_team = fpl_client.get_my_team()
+        bank = my_team['entry_history']['bank'] / 10
+        team_value = my_team['entry_history']['value'] / 10
+
+        # Get chips
+        chips_used = my_history.get('chips', [])
+        chips_available = []
+        if not any(c['name'] == 'freehit' for c in chips_used):
+            chips_available.append('Free Hit')
+
+        # Build optimal team from scratch for NEXT gameweek (Free Hit ignores current team)
+        constraints = SquadConstraints(total_budget=100.0)
+        optimizer = FPLOptimizer(available_players, fixtures, teams, constraints)
+
+        # Use optimize_squad() with target_gw parameter (now has opposing defender penalty)
+        config = OptimizationConfig()
+        squad = optimizer.optimize_squad(config=config, target_gw=target_gw)
+
+        # Generate chip recommendations
+        chip_recommendations = []
+        chip_recommendations.append(ChipRecommendation(
+            chip_name="Free Hit",
+            recommended_gameweek=target_gw,
+            reasoning="Free Hit active - this is your optimal 15-man squad for this gameweek only. Your normal team returns next week.",
+            priority=1
+        ))
+
+        return MyTeamResponse(
+            team_name=my_info.get('name', 'My Team'),
+            team_value=team_value,
+            bank=bank,
+            free_transfers=0,  # Free Hit = unlimited transfers but doesn't affect FT count
+            current_gameweek=current_gw,
+            chips_available=chips_available,
+            chip_recommendations=chip_recommendations,
+            players=[
+                PlayerResponse(
+                    id=p.id,
+                    name=p.name,
+                    team_id=p.team_id,
+                    position_name=p.position_name,
+                    cost=p.cost,
+                    cost_millions=p.cost / 10,
+                    total_points=p.total_points,
+                    form=p.form,
+                    selected_by_percent=p.selected_by_percent,
+                    is_available=p.is_available,
+                    expected_points=round(optimizer._get_xp(p.id, target_gw), 2)
+                )
+                for p in squad.players
+            ],
+            starting_11_ids=squad.starting_11_ids,
+            captain_id=squad.captain_id,
+            vice_captain_id=squad.vice_captain_id
+        )
+
+    except Exception as e:
+        logger.error(f"Error in get_free_hit_team: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class GameweekPerformance(BaseModel):
+    gameweek: int
+    minutes: int
+    total_points: int
+    goals_scored: int
+    assists: int
+    clean_sheets: int
+    bonus: int
+
+
+class TeamPlayerStats(BaseModel):
+    player_id: int
+    player_name: str
+    team_name: str
+    position: str
+    cost: float
+    total_points: int
+    form: float
+    minutes_total: int
+    recent_performance: List[GameweekPerformance]
+
+
+class TeamResponse(BaseModel):
+    id: int
+    name: str
+    short_name: str
+
+
+@app.get("/api/teams", response_model=List[TeamResponse])
+async def get_teams():
+    """Get all FPL teams."""
+    try:
+        fpl_client = get_client()
+        bootstrap = fpl_client.get_bootstrap_static()
+
+        teams_data = [Team(**t) for t in bootstrap['teams']]
+        return [
+            TeamResponse(
+                id=t.id,
+                name=t.name,
+                short_name=t.short_name
+            )
+            for t in teams_data
+        ]
+    except Exception as e:
+        logger.error(f"Error in get_teams: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/team-analysis", response_model=List[TeamPlayerStats])
+async def get_team_analysis(team_id: Optional[int] = None):
+    """
+    Get detailed performance stats for all players in a specific team,
+    including minutes played and recent gameweek performance.
+    """
+    try:
+        fpl_client = get_client()
+        bootstrap = fpl_client.get_bootstrap_static()
+
+        # Get teams
+        teams_data = [Team(**t) for t in bootstrap['teams']]
+        teams_dict = {t.id: t for t in teams_data}
+
+        # Get all players
+        all_players = [Player(**p) for p in bootstrap['elements']]
+
+        # Filter by team if specified
+        if team_id:
+            players_to_analyze = [p for p in all_players if p.team_id == team_id]
+        else:
+            # If no team specified, return empty list
+            players_to_analyze = []
+
+        # Helper function to fetch single player stats
+        def fetch_player_stats(player: Player) -> Optional[TeamPlayerStats]:
+            try:
+                # Fetch player summary (includes history)
+                summary = fpl_client.get_element_summary(player.id)
+                history = summary.get('history', [])
+
+                # Get last 5 gameweeks
+                recent_gws = history[-5:] if len(history) > 0 else []
+
+                # Build recent performance
+                recent_performance = []
+                for gw_data in recent_gws:
+                    recent_performance.append(GameweekPerformance(
+                        gameweek=gw_data.get('round', 0),
+                        minutes=gw_data.get('minutes', 0),
+                        total_points=gw_data.get('total_points', 0),
+                        goals_scored=gw_data.get('goals_scored', 0),
+                        assists=gw_data.get('assists', 0),
+                        clean_sheets=gw_data.get('clean_sheets', 0),
+                        bonus=gw_data.get('bonus', 0)
+                    ))
+
+                # Calculate total minutes
+                minutes_total = sum(gw.get('minutes', 0) for gw in history)
+
+                team = teams_dict.get(player.team_id)
+                team_name = team.short_name if team else "Unknown"
+
+                return TeamPlayerStats(
+                    player_id=player.id,
+                    player_name=player.name,
+                    team_name=team_name,
+                    position=player.position_name,
+                    cost=player.cost_millions,
+                    total_points=player.total_points,
+                    form=player.form,
+                    minutes_total=minutes_total,
+                    recent_performance=recent_performance
+                )
+
+            except Exception as e:
+                logger.warning(f"Failed to fetch stats for player {player.id}: {e}")
+                return None
+
+        # Fetch all player stats in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all tasks
+            future_to_player = {executor.submit(fetch_player_stats, player): player for player in players_to_analyze}
+
+            # Collect results as they complete
+            result = []
+            for future in future_to_player:
+                player_stats = future.result()
+                if player_stats:
+                    result.append(player_stats)
+
+        # Sort by total points descending
+        result.sort(key=lambda x: x.total_points, reverse=True)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in get_team_analysis: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -149,22 +149,25 @@ class FPLOptimizer:
 
     def optimize_squad(
         self,
-        config: OptimizationConfig = None
+        config: OptimizationConfig = None,
+        target_gw: int = None
     ) -> OptimizedSquad:
         """
         Optimize a fresh squad (no existing players).
 
         Args:
             config: Optimization configuration.
+            target_gw: Target gameweek to optimize for (defaults to current).
 
         Returns:
             OptimizedSquad with best team.
         """
         config = config or OptimizationConfig()
 
-        # Precompute expected points for next gameweek
+        # Precompute expected points for target gameweek
         current_gw = self._get_current_gameweek()
-        self._precompute_expected_points(current_gw, current_gw)
+        optimization_gw = target_gw if target_gw is not None else current_gw
+        self._precompute_expected_points(optimization_gw, optimization_gw)
 
         # Create the optimization problem
         self.model = pulp.LpProblem("FPL_Fresh_Squad", pulp.LpMaximize)
@@ -186,11 +189,47 @@ class FPLOptimizer:
         }
 
         # Objective function based on expected points
-        objective_values = self._get_objective_values(config, current_gw)
+        objective_values = self._get_objective_values(config, optimization_gw)
+
+        # Soft penalties for conflicting fixtures
+        fixture_penalty = {}
+        for p in self.players:
+            fixture_penalty[p.id] = 0.0
+
+        # Get fixtures for the optimization gameweek
+        gw_fixtures = [f for f in self.fixtures if f.event == optimization_gw]
+        for fixture in gw_fixtures:
+            # Penalty 1: Opposing defenders (both teams' defenders in same match)
+            home_defenders = [p.id for p in self.players if p.team_id == fixture.team_h and p.position_name == 'DEF']
+            away_defenders = [p.id for p in self.players if p.team_id == fixture.team_a and p.position_name == 'DEF']
+
+            for home_def in home_defenders:
+                for away_def in away_defenders:
+                    fixture_penalty[home_def] += -1.0
+                    fixture_penalty[away_def] += -1.0
+
+            # Penalty 2: GK vs opposing attackers (goalkeeper facing your own forwards/mids)
+            home_gks = [p.id for p in self.players if p.team_id == fixture.team_h and p.position_name == 'GKP']
+            away_gks = [p.id for p in self.players if p.team_id == fixture.team_a and p.position_name == 'GKP']
+            home_attackers = [p.id for p in self.players if p.team_id == fixture.team_h and p.position_name in ['FWD', 'MID']]
+            away_attackers = [p.id for p in self.players if p.team_id == fixture.team_a and p.position_name in ['FWD', 'MID']]
+
+            # Home GK vs away attackers
+            for home_gk in home_gks:
+                for away_att in away_attackers:
+                    fixture_penalty[home_gk] += -2.0  # Stronger penalty for GK conflicts
+                    fixture_penalty[away_att] += -2.0
+
+            # Away GK vs home attackers
+            for away_gk in away_gks:
+                for home_att in home_attackers:
+                    fixture_penalty[away_gk] += -2.0
+                    fixture_penalty[home_att] += -2.0
 
         self.model += pulp.lpSum([
             starting_vars[p.id] * objective_values[p.id] +
-            captain_vars[p.id] * objective_values[p.id]  # Captain gets 2x points
+            captain_vars[p.id] * objective_values[p.id] +  # Captain gets 2x points
+            starting_vars[p.id] * fixture_penalty[p.id]  # Penalty for fixture conflicts
             for p in self.players
         ])
 
@@ -204,7 +243,7 @@ class FPLOptimizer:
         if self.model.status != pulp.LpStatusOptimal:
             raise Exception(f"Optimization failed: {pulp.LpStatus[self.model.status]}")
 
-        return self._extract_solution(self.player_vars, starting_vars, captain_vars, current_gw)
+        return self._extract_solution(self.player_vars, starting_vars, captain_vars, optimization_gw)
 
     def optimize_with_transfers(
         self,
@@ -420,11 +459,41 @@ class FPLOptimizer:
             for p in self.players:
                 bench_boost_weight[p.id] = 0.0
 
+        # CRITICAL FIX: Soft penalty for starting defenders from opposing teams in same fixture
+        # This discourages (but doesn't forbid) having Chelsea DEF + Everton DEF when they play each other
+        # ONLY apply this penalty for regular gameweeks, NOT when preparing for Bench Boost or other chips
+        opposing_defender_penalty = {}
+        current_gw = self._get_current_gameweek()
+        for p in self.players:
+            opposing_defender_penalty[p.id] = 0.0
+
+        # Skip this penalty if we're preparing for Bench Boost (want all 15 players scoring)
+        # Check if Bench Boost is in available chips and we're near the recommended gameweek
+        is_preparing_bench_boost = (Chip.BENCH_BOOST in config.available_chips and
+                                    any(bench_boost_weight.values()))  # BB weight is set if preparing
+
+        if not is_preparing_bench_boost:
+            for fixture in self.fixtures:
+                if fixture.event == gameweek and fixture.team_h and fixture.team_a:
+                    # Get defenders from both teams
+                    home_defenders = [p.id for p in self.players if p.team_id == fixture.team_h and p.position_name == 'DEF']
+                    away_defenders = [p.id for p in self.players if p.team_id == fixture.team_a and p.position_name == 'DEF']
+
+                    # Apply penalty for each pair of opposing defenders in starting 11
+                    # Penalty = -2 points per pair (roughly the value of a lost clean sheet)
+                    for home_def in home_defenders:
+                        for away_def in away_defenders:
+                            # This creates a penalty when BOTH are in starting 11
+                            # We'll apply it as -1 to each (total -2 when both start)
+                            opposing_defender_penalty[home_def] += -1.0
+                            opposing_defender_penalty[away_def] += -1.0
+
         model += pulp.lpSum([
             starting_vars[p.id] * objective_values[p.id] +  # Starting 11 full weight
             captain_vars[p.id] * objective_values[p.id] +  # Captain bonus
             player_vars[p.id] * availability_penalty[p.id] +  # Penalty for unavailable
-            (player_vars[p.id] - starting_vars[p.id]) * bench_boost_weight[p.id]  # Bench bonus for BB prep
+            (player_vars[p.id] - starting_vars[p.id]) * bench_boost_weight[p.id] +  # Bench bonus for BB prep
+            starting_vars[p.id] * opposing_defender_penalty[p.id]  # Penalty for opposing defenders
             for p in self.players
         ])
 
@@ -565,6 +634,15 @@ class FPLOptimizer:
                 captain_vars[player.id] <= starting_vars[player.id],
                 f"captain_must_start_{player.id}"
             )
+
+        # CRITICAL FIX: Captain should be MID or FWD only (GKP and DEF rarely captain-worthy)
+        # This prevents the bug where defenders like Cucurella are selected as captain
+        for player in self.players:
+            if player.position_name in ['GKP', 'DEF']:
+                model += (
+                    captain_vars[player.id] == 0,
+                    f"no_gkp_def_captain_{player.id}"
+                )
 
     def _get_objective_values(self, config: OptimizationConfig, gameweek: int) -> Dict[int, float]:
         """Get objective values for each player based on config."""

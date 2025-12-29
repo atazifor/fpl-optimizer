@@ -1271,21 +1271,38 @@ class SimpleExpectedPointsCalculator(ExpectedPointsCalculator):
 
         for fixture in player_fixtures:
             is_home = fixture.team_h == player.team_id
-            difficulty = fixture.team_a_difficulty if is_home else fixture.team_h_difficulty
+            opponent_id = fixture.team_a if is_home else fixture.team_h
 
-            # Difficulty multiplier
-            diff_mult = 1.5 - (difficulty * 0.125)  # 1.375 to 0.875
+            # Get team strength from FPL API data
+            player_team = teams.get(player.team_id)
+            opponent_team = teams.get(opponent_id)
 
-            # Home/away
+            # Use FPL strength ratings (1000-1400 scale) for more accurate predictions
+            # This considers actual team quality, not just generic fixture difficulty
+            if player.position_name in ('DEF', 'GKP'):
+                # Defenders/GKs benefit from OPPONENT'S weak attack
+                if opponent_team:
+                    opponent_attack = opponent_team.strength_attack_away if not is_home else opponent_team.strength_attack_home
+                else:
+                    opponent_attack = 1100  # Default average
+                # Normalize to 0.7-1.3 range (inverse: weaker opponent attack = better for defenders)
+                strength_mult = 2.0 - (opponent_attack / 1100)
+            else:
+                # Attackers/Mids benefit from OPPONENT'S weak defense
+                if opponent_team:
+                    opponent_defense = opponent_team.strength_defence_away if not is_home else opponent_team.strength_defence_home
+                else:
+                    opponent_defense = 1100  # Default average
+                # Normalize to 0.7-1.3 range (inverse: weaker opponent defense = better for attackers)
+                strength_mult = 2.0 - (opponent_defense / 1100)
+
+            # Clamp multiplier to reasonable bounds
+            strength_mult = max(0.7, min(1.3, strength_mult))
+
+            # Home/away advantage
             home_mult = 1.08 if is_home else 0.95
 
-            # Position adjustment
-            if player.position_name == 'DEF':
-                diff_mult = 1.7 - (difficulty * 0.175)  # Defenders more affected
-            elif player.position_name == 'FWD':
-                diff_mult = 1.3 - (difficulty * 0.075)  # Forwards less affected
-
-            fixture_xp = base * diff_mult * home_mult
+            fixture_xp = base * strength_mult * home_mult
             total += fixture_xp
 
         # Apply chance of playing multiplier (CRITICAL for injury-prone players)
